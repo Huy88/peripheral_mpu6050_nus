@@ -35,6 +35,27 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
+#define LOG_MODULE_NAME peripheral_uart
+LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+
+#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
+#define PRIORITY 7
+
+#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
+#define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
+
+#define RUN_STATUS_LED DK_LED1
+#define RUN_LED_BLINK_INTERVAL 1000
+
+#define CON_STATUS_LED DK_LED2
+
+#define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
+#define KEY_PASSKEY_REJECT DK_BTN2_MSK
+
+#define UART_BUF_SIZE CONFIG_BT_NUS_UART_BUFFER_SIZE
+#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
+#define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
+
 // MPU6050 I2C地址
 #define MPU6050_WHO_AM_I 0x75
 
@@ -58,6 +79,18 @@
 #define MPU6050_RA_GYRO_YOUT_L      0x46
 #define MPU6050_RA_GYRO_ZOUT_H      0x47
 #define MPU6050_RA_GYRO_ZOUT_L      0x48
+
+static struct bt_gatt_exchange_params exchange_params;
+static void exchange_func(struct bt_conn *conn, uint8_t err,
+    struct bt_gatt_exchange_params *params)
+{
+    if (!err) {
+        /* According to 3.4.7.1 Handle Value Notification off the ATT protocol.
+         * Maximum supported notification is ATT_MTU - 3 */
+        uint32_t bt_max_send_len = bt_gatt_get_mtu(conn) - 3;
+        printk("max send len is %d", bt_max_send_len);
+    }
+}
 
 // I2C節點
 #define I2C0_NODE DT_NODELABEL(mysensor)
@@ -133,26 +166,7 @@ bool Who_am_i(void) {
     }
 }
 
-#define LOG_MODULE_NAME peripheral_uart
-LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
-#define STACKSIZE CONFIG_BT_NUS_THREAD_STACK_SIZE
-#define PRIORITY 7
-
-#define DEVICE_NAME CONFIG_BT_DEVICE_NAME
-#define DEVICE_NAME_LEN	(sizeof(DEVICE_NAME) - 1)
-
-#define RUN_STATUS_LED DK_LED1
-#define RUN_LED_BLINK_INTERVAL 1000
-
-#define CON_STATUS_LED DK_LED2
-
-#define KEY_PASSKEY_ACCEPT DK_BTN1_MSK
-#define KEY_PASSKEY_REJECT DK_BTN2_MSK
-
-#define UART_BUF_SIZE CONFIG_BT_NUS_UART_BUFFER_SIZE
-#define UART_WAIT_FOR_BUF_DELAY K_MSEC(50)
-#define UART_WAIT_FOR_RX CONFIG_BT_NUS_UART_RX_WAIT_TIME
 
 static K_SEM_DEFINE(ble_init_ok, 0, 1);
 
@@ -188,8 +202,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	LOG_INF("Connected %s", addr);
-
 	current_conn = bt_conn_ref(conn);
+	
+	int rc;
+
+	/* maximize ATT MTU at peer side (CONFIG_BT_L2CAP_TX_MTU)*/
+    exchange_params.func = exchange_func;
+	LOG_INF("sending ATT MTU to peer..");
+	rc = bt_gatt_exchange_mtu(current_conn, &exchange_params);
+	if (rc) {
+		LOG_ERR("failed to negotiate maximum mtu with peer [%d]", rc);
+	}
 
 	dk_set_led_on(CON_STATUS_LED);
 }
@@ -265,7 +288,12 @@ int main(void)
 		printk("I2C bus %s is not ready!\n", dev_i2c.bus->name);
 		return -1;
 	}
-
+	if(!Who_am_i())
+	{
+		printk("Not mpu6050\n");
+	}
+	init_mpu6050();
+	printk("Initialized mpu6050!!\n");
 	configure_gpio();
 
 	err = bt_enable(NULL);
@@ -309,31 +337,28 @@ void ble_write_thread(void)
 	};
 
 	for (;;) {
-		/* Wait indefinitely for data to be sent over bluetooth */
-		struct uart_data_t *buf = k_fifo_get(&fifo_uart_rx_data,
-						     K_FOREVER);
+		int16_t accel[3]; // x, y, z 加速度
+		int16_t gyro[3];  // x, y, z 角速度
 
-		int plen = MIN(sizeof(nus_data.data) - nus_data.len, buf->len);
-		int loc = 0;
+		// 從 MPU6050 讀取數據
+		read_gyro(&gyro[0],&gyro[1],&gyro[2]);
+		printk("Gx=%d",gyro[0]);
+		read_accel(&accel[0],&accel[1],&accel[2]);
 
-		while (plen > 0) {
-			memcpy(&nus_data.data[nus_data.len], &buf->data[loc], plen);
-			nus_data.len += plen;
-			loc += plen;
+		char message[100];
+		int message_len;
+		// 將加速度和陀螺儀數據格式化
+		message_len = snprintf(message, sizeof(message), 
+				"AX=%dAY=%dAZ=%dGX=%dGY=%dGZ=%d\n", 
+				accel[0], accel[1], accel[2], 
+				gyro[0], gyro[1], gyro[2]);
 
-			if (nus_data.len >= sizeof(nus_data.data) ||
-			   (nus_data.data[nus_data.len - 1] == '\n') ||
-			   (nus_data.data[nus_data.len - 1] == '\r')) {
-				if (bt_nus_send(NULL, nus_data.data, nus_data.len)) {
-					LOG_WRN("Failed to send data over BLE connection");
-				}
-				nus_data.len = 0;
-			}
 
-			plen = MIN(sizeof(nus_data.data), buf->len - loc);
+		// 透過 BLE 傳送數據
+		if (bt_nus_send(current_conn, message, message_len)) {
+			LOG_WRN("Failed to send data over BLE connection");
 		}
-
-		k_free(buf);
+		k_msleep(100);
 	}
 }
 
