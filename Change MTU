@@ -1,0 +1,29 @@
+struct bt_gatt_exchange_params exchange_params;
+static void exchange_func(struct bt_conn *conn, uint8_t err,
+    struct bt_gatt_exchange_params *params)
+{
+    if (!err) {
+        /* According to 3.4.7.1 Handle Value Notification off the ATT protocol.
+         * Maximum supported notification is ATT_MTU - 3 */
+        uint32_t bt_max_send_len = bt_gatt_get_mtu(conn) - 3;
+        printk("max send len is %d", bt_max_send_len);
+    }
+}
+
+
+//Below code is added into connected funtion
+static void connected{
+	int rc;
+
+	/* maximize ATT MTU at peer side (CONFIG_BT_L2CAP_TX_MTU)*/
+    exchange_params.func = exchange_func;
+	LOG_INF("sending ATT MTU to peer..");
+	rc = bt_gatt_exchange_mtu(current_conn, &exchange_params);
+	if (rc) {
+		LOG_ERR("failed to negotiate maximum mtu with peer [%d]", rc);
+	}
+}
+
+//And add these to prj.conf
+CONFIG_BT_L2CAP_TX_MTU=247
+CONFIG_BT_GATT_CLIENT=y
